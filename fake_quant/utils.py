@@ -134,6 +134,8 @@ def parser_gen():
     # General Quantization Arguments
     parser.add_argument('--int8_down_proj', action=argparse.BooleanOptionalAction, default=False,
                         help='Use INT8 for Down Projection! If this set, both weights and activations of this layer will be in INT8')
+    parser.add_argument('--bfp_attn_ops', action=argparse.BooleanOptionalAction, default=False,
+                        help='BFP-quantize Q/K before QK and attention/V before AV. This disables fused SDPA for LLaMA attention')
 
     # KV-Cache Quantization Arguments
     parser.add_argument('--v_bits', type=int, default=16,

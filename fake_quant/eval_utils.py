@@ -58,6 +58,7 @@ def evaluator(model, testenc, dev, args):
     cache = {'i': 0, 'attention_mask': [None] * nbatches}
     if llama_type:
         cache['position_ids'] = [None] * nbatches
+        cache['position_embeddings'] = [None] * nbatches
     class Catcher(torch.nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -67,6 +68,7 @@ def evaluator(model, testenc, dev, args):
             cache['attention_mask'][cache['i']] = kwargs.get('attention_mask')
             if llama_type:
                 cache['position_ids'][cache['i']] = kwargs.get('position_ids')
+                cache['position_embeddings'][cache['i']] = kwargs.get('position_embeddings')
             cache['i'] += 1
             raise ValueError
     layers[0] = Catcher(layers[0])
@@ -90,6 +92,7 @@ def evaluator(model, testenc, dev, args):
     elif llama_type:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         position_ids = cache['position_ids']
+        position_embeddings = cache['position_embeddings']
 
     torch.cuda.empty_cache()
     outs = [0] * nbatches
@@ -122,7 +125,15 @@ def evaluator(model, testenc, dev, args):
             if opt_type:
                 outs[j] = layer(inps[j], attention_mask=attention_mask)[0]
             elif llama_type:
-                outs[j] = layer(inps[j], attention_mask=attention_mask, position_ids=position_ids[j])[0]
+                if position_embeddings[j] is None:
+                    outs[j] = layer(inps[j], attention_mask=attention_mask, position_ids=position_ids[j])[0]
+                else:
+                    outs[j] = layer(
+                        inps[j],
+                        attention_mask=attention_mask,
+                        position_ids=position_ids[j],
+                        position_embeddings=position_embeddings[j],
+                    )[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

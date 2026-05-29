@@ -55,3 +55,5 @@ To keep weights in the original precision and use BFP only for activations and K
 ```bash
 /bin/python main.py --model meta-llama/Llama-2-7b-hf --rotate --a_bits 4 --a_quant_method bfp --v_bits 4 --v_quant_method bfp --k_bits 4 --k_quant_method bfp --w_bits 16
 ```
+
+Add `--bfp_attn_ops` to also BFP-quantize Q/K before the QK matmul and attention/V before the AV matmul.

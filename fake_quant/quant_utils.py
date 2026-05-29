@@ -1,6 +1,7 @@
 import math
 import transformers
 import torch
+import inspect
 import utils
 import hadamard_utils
 import fast_hadamard_transform
@@ -49,6 +50,32 @@ def bfp_quant(x, scale, minq, maxq):
 def bfp_quant_dequant(x, scale, minq, maxq):
     q, scale = bfp_quant(x, scale, minq, maxq)
     return scale * q
+
+def bfp_quant_dequant_dynamic(x, bits, groupsize=-1, clip_ratio=1.0):
+    if bits == 16:
+        return x
+    if groupsize == -1:
+        groupsize = BFP_DEFAULT_BLOCK_SIZE
+
+    x_dtype = x.dtype
+    minq, maxq = get_minq_maxq(bits, True)
+    minq = minq.to(x.device)
+    maxq = maxq.to(x.device)
+
+    init_shape = x.shape
+    pad = (groupsize - x.shape[-1] % groupsize) % groupsize
+    if pad > 0:
+        x = torch.nn.functional.pad(x, (0, pad))
+    reshaped_x = x.reshape(-1, x.shape[-1] // groupsize, groupsize)
+    xmax = torch.amax(torch.abs(reshaped_x), dim=-1, keepdim=True) * clip_ratio
+    tmp = xmax == 0
+    scale = torch.pow(2.0, torch.ceil(torch.log2(xmax / maxq)))
+    scale[tmp] = 1
+    q = torch.clamp(torch.round(reshaped_x / scale), minq, maxq)
+    out = (q * scale).reshape(x.shape)
+    if pad > 0:
+        out = out[..., :init_shape[-1]]
+    return out.reshape(init_shape).to(x_dtype)
 
 
 def two_compl(x, bits: int):
@@ -417,6 +444,175 @@ class WeightQuantizer(torch.nn.Module):
     def ready(self):
         return torch.all(self.scale != 0)
 
+
+class BFPAttentionOpsWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        module,
+        qk_bits,
+        qk_groupsize,
+        qk_clip_ratio,
+        qk_quant_method,
+        av_bits,
+        av_groupsize,
+        av_clip_ratio,
+        av_quant_method,
+    ):
+        super().__init__()
+        self.module = module
+        self.config = module.config
+        self.layer_idx = module.layer_idx
+        self.num_heads = module.num_heads
+        self.num_key_value_heads = module.num_key_value_heads
+        self.num_key_value_groups = module.num_key_value_groups
+        self.head_dim = module.head_dim
+        self.hidden_size = module.hidden_size
+        self.scaling = getattr(module, 'scaling', self.head_dim ** -0.5)
+        self.attention_dropout = getattr(module, 'attention_dropout', 0.0)
+        self.qk_bits = qk_bits
+        self.qk_groupsize = qk_groupsize
+        self.qk_clip_ratio = qk_clip_ratio
+        self.qk_quant_method = qk_quant_method
+        self.av_bits = av_bits
+        self.av_groupsize = av_groupsize
+        self.av_clip_ratio = av_clip_ratio
+        self.av_quant_method = av_quant_method
+        self.legacy_return = 'past_key_value' in inspect.signature(module.forward).parameters
+
+    def _apply_rotary_pos_emb(self, query_states, key_states, value_states, position_ids, position_embeddings):
+        from transformers.models.llama import modeling_llama
+
+        if position_embeddings is None:
+            if not hasattr(self.module, 'rotary_emb'):
+                raise ValueError('position_embeddings is required for this transformers LLaMA attention version')
+            try:
+                cos, sin = self.module.rotary_emb(value_states, position_ids)
+            except TypeError:
+                cos, sin = self.module.rotary_emb(value_states, seq_len=key_states.shape[-2])
+        else:
+            cos, sin = position_embeddings
+
+        try:
+            query_states, key_states = modeling_llama.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
+        except TypeError:
+            query_states, key_states = modeling_llama.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        return query_states, key_states, cos, sin
+
+    def _repeat_kv(self, key_states, value_states):
+        from transformers.models.llama import modeling_llama
+
+        return (
+            modeling_llama.repeat_kv(key_states, self.num_key_value_groups),
+            modeling_llama.repeat_kv(value_states, self.num_key_value_groups),
+        )
+
+    def _maybe_bfp(self, x, bits, groupsize, clip_ratio, quant_method):
+        if bits >= 16 or quant_method != 'bfp':
+            return x
+        return bfp_quant_dequant_dynamic(x, bits, groupsize=groupsize, clip_ratio=clip_ratio)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        past_key_values=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        query_shape = (*input_shape, self.num_heads, self.head_dim)
+        kv_shape = (*input_shape, self.num_key_value_heads, self.head_dim)
+
+        query_states = self.module.q_proj(hidden_states).view(query_shape).transpose(1, 2)
+        key_states = self.module.k_proj(hidden_states).view(kv_shape).transpose(1, 2)
+        value_states = self.module.v_proj(hidden_states).view(kv_shape).transpose(1, 2)
+
+        query_states, key_states, cos, sin = self._apply_rotary_pos_emb(
+            query_states, key_states, value_states, position_ids, position_embeddings
+        )
+
+        past_key_value = past_key_values if past_key_values is not None else past_key_value
+        if past_key_value is not None:
+            cache_kwargs = {'sin': sin, 'cos': cos, 'cache_position': cache_position}
+            try:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            except TypeError:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
+
+        if self.qk_bits < 16:
+            dtype = query_states.dtype
+            scale = 1 / math.sqrt(query_states.shape[-1])
+            query_states = fast_hadamard_transform.hadamard_transform(
+                query_states.float().contiguous(), scale=scale
+            ).to(dtype)
+            key_states = fast_hadamard_transform.hadamard_transform(
+                key_states.float().contiguous(), scale=scale
+            ).to(dtype)
+
+        key_states, value_states = self._repeat_kv(key_states, value_states)
+
+        query_states = self._maybe_bfp(
+            query_states, self.qk_bits, self.qk_groupsize, self.qk_clip_ratio, self.qk_quant_method
+        )
+        key_states = self._maybe_bfp(
+            key_states, self.qk_bits, self.qk_groupsize, self.qk_clip_ratio, self.qk_quant_method
+        )
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                causal_mask = attention_mask[:, None, None, : key_states.shape[-2]]
+            else:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self._maybe_bfp(
+            attn_weights, self.av_bits, self.av_groupsize, self.av_clip_ratio, self.av_quant_method
+        )
+        value_states = self._maybe_bfp(
+            value_states, self.av_bits, self.av_groupsize, self.av_clip_ratio, self.av_quant_method
+        )
+        attn_weights = torch.nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
+
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, self.hidden_size)
+        attn_output = self.module.o_proj(attn_output)
+        returned_attn_weights = attn_weights if output_attentions else None
+
+        if self.legacy_return:
+            return attn_output, returned_attn_weights, past_key_value
+        return attn_output, returned_attn_weights
+
+
+def add_bfp_attention_ops(model, args):
+    from transformers.models.llama import modeling_llama
+
+    for layer in model.model.layers:
+        if isinstance(layer.self_attn, BFPAttentionOpsWrapper):
+            continue
+        if not isinstance(layer.self_attn, modeling_llama.LlamaAttention):
+            raise NotImplementedError('BFP attention ops are only implemented for LLaMA attention')
+        layer.self_attn = BFPAttentionOpsWrapper(
+            layer.self_attn,
+            qk_bits=args.k_bits,
+            qk_groupsize=args.k_groupsize,
+            qk_clip_ratio=args.k_clip_ratio,
+            qk_quant_method=args.k_quant_method,
+            av_bits=args.v_bits,
+            av_groupsize=args.v_groupsize,
+            av_clip_ratio=args.v_clip_ratio,
+            av_quant_method=args.v_quant_method,
+        )
 
 
 def add_actquant(module, name='', layers=[torch.nn.Linear,

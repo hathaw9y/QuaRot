@@ -112,7 +112,9 @@ def main():
                                               clip_ratio=layer_a_clip,
                                               quant_method=layer_a_quant_method)
 
-    if args.k_bits < 16:
+    if args.bfp_attn_ops:
+        quant_utils.add_bfp_attention_ops(model, args)
+    elif args.k_bits < 16:
         if args.k_pre_rope:
             raise NotImplementedError("Pre-RoPE quantization is not supported yet!")
         else:
