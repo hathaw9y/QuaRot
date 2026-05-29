@@ -98,7 +98,9 @@ def parser_gen():
                         help='''Number of bits for inputs of the Linear layers. This will be
                         for all the linear layers in the model (including down-projection and out-projection)''')
     parser.add_argument('--a_groupsize', type=int, default=-1, 
-                        help='Groupsize for activation quantization. Note that this should be the same as w_groupsize')
+                        help='Groupsize for activation quantization. Note that this should be the same as w_groupsize. For BFP, -1 defaults to block size 32')
+    parser.add_argument('--a_quant_method', type=str, default='int', choices=['int', 'bfp'],
+                        help='Activation quantization method. int uses the original affine quantization; bfp uses block floating point')
     parser.add_argument('--a_asym', action=argparse.BooleanOptionalAction, default=False,
                         help='ASymmetric Activation quantization (default: False)')
     parser.add_argument('--a_clip_ratio', type=float, default=1.0,
@@ -136,6 +138,8 @@ def parser_gen():
                         help='''Number of bits for V-cache quantization. 
                         Note that quantizing the V-cache does not need any other rotation''')
     parser.add_argument('--v_groupsize', type=int, default=-1)
+    parser.add_argument('--v_quant_method', type=str, default='int', choices=['int', 'bfp'],
+                        help='V-cache quantization method. int uses the original affine quantization; bfp uses block floating point')
     parser.add_argument('--v_asym', action=argparse.BooleanOptionalAction, default=False,
                         help='ASymmetric V-cache quantization')
     parser.add_argument('--v_clip_ratio', type=float, default=1.0,
@@ -145,6 +149,8 @@ def parser_gen():
                         help='''Number of bits for K-cache quantization. 
                         Note that quantizing the K-cache needs another rotation for the keys/queries''')
     parser.add_argument('--k_groupsize', type=int, default=-1)
+    parser.add_argument('--k_quant_method', type=str, default='int', choices=['int', 'bfp'],
+                        help='K-cache quantization method. int uses the original affine quantization; bfp uses block floating point')
     parser.add_argument('--k_asym', action=argparse.BooleanOptionalAction, default=False, 
                         help='ASymmetric K-cache quantization')
     parser.add_argument('--k_pre_rope', action=argparse.BooleanOptionalAction, default=False, 

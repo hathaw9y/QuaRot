@@ -104,11 +104,11 @@ def random_orthogonal_matrix(size, device):
     q *= torch.sign(torch.diag(r)).unsqueeze(0)
     return q
 
-def get_orthogonal_matrix(size, mode, device=utils.DEV):
+def get_orthogonal_matrix(size, mode, device=utils.DEV, block_size=None):
     if mode == 'random':
         return random_orthogonal_matrix(size, device)
     elif mode == 'hadamard':
-        return random_hadamard_matrix(size, device)
+        return random_hadamard_matrix(size, device, block_size=block_size)
     else:
         raise ValueError(f'Unknown mode {mode}')
 
@@ -228,8 +228,12 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
 
 @torch.inference_mode()
 def rotate_model(model, args):
+    block_size = None
+    if getattr(args, 'a_quant_method', 'int') == 'bfp':
+        block_size = args.a_groupsize if args.a_groupsize > 0 else quant_utils.BFP_DEFAULT_BLOCK_SIZE
     Q = get_orthogonal_matrix(model.config.hidden_size,
-                                                args.rotate_mode)
+                                                args.rotate_mode,
+                                                block_size=block_size)
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
@@ -282,8 +286,10 @@ class QKRotationWrapper(torch.nn.Module):
             self.k_groupsize = kwargs['k_groupsize']
             self.k_sym = kwargs['k_sym']
             self.k_clip_ratio = kwargs['k_clip_ratio']
+            self.k_quant_method = kwargs['k_quant_method']
             self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, #we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio)
+                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio,
+                                   quant_method=self.k_quant_method)
 
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)

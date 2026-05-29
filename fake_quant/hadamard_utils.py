@@ -82,12 +82,20 @@ def matmul_hadU(X, transpose=False):
 def matmul_hadUt(X):
     return matmul_hadU(X, transpose=True)
 
-def random_hadamard_matrix(size, device):
+def random_hadamard_matrix(size, device, block_size=None):
     # See https://cornell-relaxml.github.io/quip-sharp/ , Section "Randomized Hadamard Transformation"
-    Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
-    Q = Q * 2 - 1
-    Q = torch.diag(Q)
-    return matmul_hadU(Q).to(device)
+    if block_size is None:
+        block_size = size
+    assert size % block_size == 0, "Hadamard size should be divisible by block_size"
+    assert is_pow2(block_size), "Hadamard block_size must be a power of 2"
+
+    Q = torch.zeros((size, size), dtype=torch.float64)
+    for start in range(0, size, block_size):
+        signs = torch.randint(low=0, high=2, size=(block_size,)).to(torch.float64)
+        signs = signs * 2 - 1
+        block = matmul_hadU(torch.diag(signs))
+        Q[start:start + block_size, start:start + block_size] = block
+    return Q.to(device)
 
 def matmul_hadU_cuda(X, hadK, K):
     n = X.shape[-1]

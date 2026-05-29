@@ -15,9 +15,12 @@ Currently, we only support **LLaMa-2** models. You can simply run the `main.py` 
 - `--tasks`: the tasks for LM-Eval
 - `--cal_dataset`: the calibration dataset for GPTQ quantization
 - `--a_bits`: the number of bits for activation quantization
+- `--a_quant_method`: the activation quantization method (`int` or `bfp`)
 - `--w_bits`: the number of bits for weight quantization
 - `--v_bits`: the number of bits for value quantization
+- `--v_quant_method`: the value quantization method (`int` or `bfp`)
 - `--k_bits`: the number of bits for key quantization
+- `--k_quant_method`: the key quantization method (`int` or `bfp`)
 - `--w_clip`: Whether we want to clip the weights
 - `--a_clip_ratio`: The ratio of clipping for activation
 - `--k_clip_ratio`: The ratio of clipping for key
@@ -35,4 +38,19 @@ For example, to run the perplexity of `LLaMA2-7B` model with quantizing all weig
 
 ```bash
 /bin/python main.py --model meta-llama/Llama-2-7b-hf  --rotate --a_bits 4 --v_bits 4 --k_bits 4 --w_bits 4 --w_clip
+```
+
+To use block floating point for activation quantization:
+
+```bash
+/bin/python main.py --model meta-llama/Llama-2-7b-hf --rotate --a_bits 4 --a_quant_method bfp --w_bits 4 --w_clip
+```
+
+When `--a_quant_method bfp` is used with the default `--a_groupsize -1`, the BFP block size defaults to 32.
+The random Hadamard rotation also uses a block-diagonal matrix with the same BFP block size.
+
+To keep weights in the original precision and use BFP only for activations and KV:
+
+```bash
+/bin/python main.py --model meta-llama/Llama-2-7b-hf --rotate --a_bits 4 --a_quant_method bfp --v_bits 4 --v_quant_method bfp --k_bits 4 --k_quant_method bfp --w_bits 16
 ```

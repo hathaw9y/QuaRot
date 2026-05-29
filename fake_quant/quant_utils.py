@@ -5,6 +5,8 @@ import utils
 import hadamard_utils
 import fast_hadamard_transform
 
+BFP_DEFAULT_BLOCK_SIZE = 32
+
 def get_minq_maxq(bits, sym):
     if sym:
         maxq = torch.tensor(2**(bits-1)-1)
@@ -36,6 +38,17 @@ def sym_dequant(q, scale):
 
 def sym_quant_dequant(x, scale, maxq):
     return sym_dequant(*sym_quant(x, scale, maxq))
+
+def bfp_quant(x, scale, minq, maxq):
+    scale = scale.to(x.device)
+    minq = minq.to(x.device)
+    maxq = maxq.to(x.device)
+    q = torch.clamp(torch.round(x / scale), minq, maxq)
+    return q, scale
+
+def bfp_quant_dequant(x, scale, minq, maxq):
+    q, scale = bfp_quant(x, scale, minq, maxq)
+    return scale * q
 
 
 def two_compl(x, bits: int):
@@ -87,9 +100,11 @@ class ActQuantizer(torch.nn.Module):
     def __init__(self):
         super(ActQuantizer, self).__init__()
         self.register_buffer('maxq', torch.tensor(0))
+        self.register_buffer('minq', torch.tensor(0))
         self.register_buffer('scale', torch.zeros(1))
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
+        self.quant_method = 'int'
 
     def free(self):
         self.zero = None
@@ -99,24 +114,48 @@ class ActQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         if self.bits == 16:
             return x
+        elif self.quant_method == 'bfp':
+            return bfp_quant_dequant(x, self.scale, self.minq, self.maxq).to(x_dtype)
         elif self.sym:
             return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
         return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
 
     # Different from `forward`, this method returns quantized integers, scales (and zeros if asymmetric).
     def quantize(self, x):
-        if self.sym:
+        if self.quant_method == 'bfp':
+            return bfp_quant(x, self.scale, self.minq, self.maxq)
+        elif self.sym:
             return sym_quant(x, self.scale, self.maxq)
         else:
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
-    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0):
-        _, self.maxq = get_minq_maxq(bits, sym)
+    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0, quant_method='int'):
+        assert quant_method in ['int', 'bfp'], "quant_method should be one of ['int', 'bfp']"
+        effective_sym = True if quant_method == 'bfp' else sym
+        if quant_method == 'bfp' and groupsize == -1:
+            groupsize = BFP_DEFAULT_BLOCK_SIZE
+        self.minq, self.maxq = get_minq_maxq(bits, effective_sym)
         self.bits = bits
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
+        self.quant_method = quant_method
         assert self.clip_ratio <= 1 and self.clip_ratio > 0, 'Clip ratio should be in (0, 1]'
+
+    def _bfp_scale(self, xmax):
+        tmp = xmax == 0
+        scale = torch.pow(2.0, torch.ceil(torch.log2(xmax / self.maxq)))
+        scale[tmp] = 1
+        return scale
+
+    def find_bfp_params_per_token_groupwise(self, x):
+        init_shape = x.shape
+        reshaped_x = x.reshape(-1, x.shape[-2], x.shape[-1] // self.groupsize, self.groupsize)
+
+        xmax = torch.amax(torch.abs(reshaped_x), dim=3, keepdim=True) * self.clip_ratio
+        self.scale = self._bfp_scale(xmax)
+        self.scale = self.scale.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
+        self.zero = torch.zeros_like(self.scale)
 
     def find_params_per_token_groupwise(self, x):
         init_shape = x.shape
@@ -145,17 +184,27 @@ class ActQuantizer(torch.nn.Module):
             return
 
         dev = x.device
+        self.minq = self.minq.to(dev)
         self.maxq = self.maxq.to(dev)
 
         init_shape = x.shape
 
         if self.groupsize > 0:
             # group-wise per-token quantization
-            self.find_params_per_token_groupwise(x)
+            if self.quant_method == 'bfp':
+                self.find_bfp_params_per_token_groupwise(x)
+            else:
+                self.find_params_per_token_groupwise(x)
             utils.cleanup_memory(verbos=False)
             return
 
         reshaped_x = x.reshape((-1, x.shape[-1]))
+
+        if self.quant_method == 'bfp':
+            xmax = torch.amax(torch.abs(reshaped_x), dim=1) * self.clip_ratio
+            self.scale = self._bfp_scale(xmax).unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
+            self.zero = torch.zeros_like(self.scale)
+            return
 
         tmp = torch.zeros(reshaped_x.shape[0], device=dev)
         xmin = torch.minimum(reshaped_x.min(1)[0], tmp) * self.clip_ratio
@@ -205,11 +254,17 @@ class ActQuantWrapper(torch.nn.Module):
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
         if self.quantizer.bits < 16:
-            str_ += f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)'
+            if self.quantizer.quant_method == 'bfp':
+                str_ += ' (BFP Per-Token)'
+            else:
+                str_ += f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)'
 
         str_ += f'\nOutput Quantizer Bits: {self.out_quantizer.bits}'
         if self.out_quantizer.bits < 16:
-            str_ += f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)'
+            if self.out_quantizer.quant_method == 'bfp':
+                str_ += ' (BFP Per-Token)'
+            else:
+                str_ += f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)'
 
         return str_
 
