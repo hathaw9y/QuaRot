@@ -425,7 +425,10 @@ def add_actquant(module, name='', layers=[torch.nn.Linear,
     if isinstance(module, ActQuantWrapper):
         return
     for attr in dir(module):
-        tmp = getattr(module, attr)
+        try:
+            tmp = getattr(module, attr)
+        except AttributeError:
+            continue
         if type(tmp) in layers:
             setattr(module, attr, ActQuantWrapper(tmp))
         if type(tmp) == torch.nn.Sequential:
