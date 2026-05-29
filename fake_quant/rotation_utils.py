@@ -229,7 +229,9 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
 @torch.inference_mode()
 def rotate_model(model, args):
     block_size = None
-    if getattr(args, 'a_quant_method', 'int') == 'bfp':
+    if args.rotation_block_size > 0:
+        block_size = args.rotation_block_size
+    elif args.rotation_block_size == -1 and getattr(args, 'a_quant_method', 'int') == 'bfp':
         block_size = args.a_groupsize if args.a_groupsize > 0 else quant_utils.BFP_DEFAULT_BLOCK_SIZE
     Q = get_orthogonal_matrix(model.config.hidden_size,
                                                 args.rotate_mode,
