@@ -77,6 +77,25 @@ def bfp_quant_dequant_dynamic(x, bits, groupsize=-1, clip_ratio=1.0):
         out = out[..., :init_shape[-1]]
     return out.reshape(init_shape).to(x_dtype)
 
+def hadamard_transform_blockwise(x, block_size=None):
+    n = x.shape[-1]
+    if block_size is None:
+        block_size = n
+    assert (block_size & (block_size - 1) == 0) and block_size > 0, 'Hadamard block_size must be a power of 2'
+    assert n % block_size == 0, 'The last dimension should be divisible by Hadamard block_size'
+
+    if block_size == n:
+        return fast_hadamard_transform.hadamard_transform(
+            x.contiguous(), scale=1 / math.sqrt(n)
+        )
+
+    init_shape = x.shape
+    x = x.reshape(-1, n // block_size, block_size)
+    x = fast_hadamard_transform.hadamard_transform(
+        x.contiguous(), scale=1 / math.sqrt(block_size)
+    )
+    return x.reshape(init_shape)
+
 
 def two_compl(x, bits: int):
     return torch.where(x < 0, 2 ** bits + x, x)
@@ -275,6 +294,7 @@ class ActQuantWrapper(torch.nn.Module):
         self.K = 1
         self.online_full_had = False
         self.online_partial_had = False
+        self.online_had_block_size = None
         self.had_dim = 0
         self.fp32_had = False
 
@@ -300,8 +320,10 @@ class ActQuantWrapper(torch.nn.Module):
 
         # Rotate, if needed
         if self.online_full_had:
-            
-            if self.fp32_had: # Full Hadamard in FP32
+            if self.online_had_block_size is not None:
+                had_x = x.float() if self.fp32_had else x
+                x = hadamard_transform_blockwise(had_x, self.online_had_block_size).to(x_dtype)
+            elif self.fp32_had: # Full Hadamard in FP32
                 x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
             else: # Full Hadamard in FP16
                 x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
@@ -313,7 +335,9 @@ class ActQuantWrapper(torch.nn.Module):
                 x = x.float()
                 
             init_shape = x.shape
-            if self.K == 1:
+            if self.online_had_block_size is not None:
+                x = hadamard_transform_blockwise(x, self.online_had_block_size)
+            elif self.K == 1:
                 x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
                                                                scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
             else:
@@ -457,6 +481,7 @@ class BFPAttentionOpsWrapper(torch.nn.Module):
         av_groupsize,
         av_clip_ratio,
         av_quant_method,
+        rotation_block_size,
     ):
         super().__init__()
         self.module = module
@@ -477,6 +502,7 @@ class BFPAttentionOpsWrapper(torch.nn.Module):
         self.av_groupsize = av_groupsize
         self.av_clip_ratio = av_clip_ratio
         self.av_quant_method = av_quant_method
+        self.rotation_block_size = rotation_block_size
         self.legacy_return = 'past_key_value' in inspect.signature(module.forward).parameters
 
     def _apply_rotary_pos_emb(self, query_states, key_states, value_states, position_ids, position_embeddings):
@@ -548,12 +574,11 @@ class BFPAttentionOpsWrapper(torch.nn.Module):
 
         if self.qk_bits < 16:
             dtype = query_states.dtype
-            scale = 1 / math.sqrt(query_states.shape[-1])
-            query_states = fast_hadamard_transform.hadamard_transform(
-                query_states.float().contiguous(), scale=scale
+            query_states = hadamard_transform_blockwise(
+                query_states.float(), self.rotation_block_size
             ).to(dtype)
-            key_states = fast_hadamard_transform.hadamard_transform(
-                key_states.float().contiguous(), scale=scale
+            key_states = hadamard_transform_blockwise(
+                key_states.float(), self.rotation_block_size
             ).to(dtype)
 
         key_states, value_states = self._repeat_kv(key_states, value_states)
@@ -612,6 +637,15 @@ def add_bfp_attention_ops(model, args):
             av_groupsize=args.v_groupsize,
             av_clip_ratio=args.v_clip_ratio,
             av_quant_method=args.v_quant_method,
+            rotation_block_size=args.rotation_block_size
+            if args.rotation_block_size > 0
+            else (
+                args.a_groupsize
+                if args.rotation_block_size == -1 and args.a_quant_method == 'bfp' and args.a_groupsize > 0
+                else BFP_DEFAULT_BLOCK_SIZE
+                if args.rotation_block_size == -1 and args.a_quant_method == 'bfp'
+                else None
+            ),
         )
 
 

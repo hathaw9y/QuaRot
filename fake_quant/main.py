@@ -29,18 +29,21 @@ def main():
             
         quant_utils.add_actquant(model) #Add Activation Wrapper to the model
         qlayers = quant_utils.find_qlayers(model)
+        online_had_block_size = rotation_utils.get_rotation_block_size(args)
         for name in qlayers:
             if 'down_proj' in name:
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
                 qlayers[name].online_full_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
+                qlayers[name].online_had_block_size = online_had_block_size
                 qlayers[name].fp32_had = args.fp32_had
-            if 'o_proj' in name:
+            if args.online_o_proj_had and 'o_proj' in name:
                 had_K, K = hadamard_utils.get_hadK(model.config.num_attention_heads)
                 qlayers[name].online_partial_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
+                qlayers[name].online_had_block_size = online_had_block_size
                 qlayers[name].had_dim = model.config.hidden_size//model.config.num_attention_heads
                 qlayers[name].fp32_had = args.fp32_had
     else:
@@ -122,7 +125,8 @@ def main():
             layers = model_utils.get_layers(model)
             k_quant_config = {'k_bits':args.k_bits, "k_groupsize": args.k_groupsize,
                                           "k_sym": not(args.k_asym), "k_clip_ratio": args.k_clip_ratio,
-                                          "k_quant_method": args.k_quant_method}
+                                          "k_quant_method": args.k_quant_method,
+                                          "rotation_block_size": rotation_utils.get_rotation_block_size(args)}
             for layer in layers:
                 rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
                             layer.self_attn, 

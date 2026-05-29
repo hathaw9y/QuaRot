@@ -47,8 +47,9 @@ To use block floating point for activation quantization:
 ```
 
 When `--a_quant_method bfp` is used with the default `--a_groupsize -1`, the BFP block size defaults to 32.
-The random Hadamard rotation also uses a block-diagonal matrix with the same BFP block size.
+The random Hadamard rotation and online Hadamard rotations also use the same BFP block size.
 Use `--rotation_block_size 0` to compare against full hidden-size Hadamard rotation.
+Use `--no-online_o_proj_had` to disable the online partial Hadamard before `o_proj`.
 
 To keep weights in the original precision and use BFP only for activations and KV:
 

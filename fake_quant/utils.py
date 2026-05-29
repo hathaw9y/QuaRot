@@ -92,6 +92,8 @@ def parser_gen():
                         help='Random Seed for generating random matrix!!')
     parser.add_argument('--rotation_block_size', type=int, default=-1,
                         help='Hadamard rotation block size. -1 uses BFP block size when BFP is enabled; 0 uses full hidden-size rotation')
+    parser.add_argument('--online_o_proj_had', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply online partial Hadamard before o_proj (default: True)')
     parser.add_argument('--fp32_had', action=argparse.BooleanOptionalAction, default=False,
                         help='Apply Hadamard rotation in FP32 (default: False)')
 

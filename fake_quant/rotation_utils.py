@@ -112,6 +112,13 @@ def get_orthogonal_matrix(size, mode, device=utils.DEV, block_size=None):
     else:
         raise ValueError(f'Unknown mode {mode}')
 
+def get_rotation_block_size(args):
+    if args.rotation_block_size > 0:
+        return args.rotation_block_size
+    if args.rotation_block_size == -1 and getattr(args, 'a_quant_method', 'int') == 'bfp':
+        return args.a_groupsize if args.a_groupsize > 0 else quant_utils.BFP_DEFAULT_BLOCK_SIZE
+    return None
+
     
 
 def rotate_embeddings(model, Q: torch.Tensor) -> None:
@@ -228,11 +235,7 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
 
 @torch.inference_mode()
 def rotate_model(model, args):
-    block_size = None
-    if args.rotation_block_size > 0:
-        block_size = args.rotation_block_size
-    elif args.rotation_block_size == -1 and getattr(args, 'a_quant_method', 'int') == 'bfp':
-        block_size = args.a_groupsize if args.a_groupsize > 0 else quant_utils.BFP_DEFAULT_BLOCK_SIZE
+    block_size = get_rotation_block_size(args)
     Q = get_orthogonal_matrix(model.config.hidden_size,
                                                 args.rotate_mode,
                                                 block_size=block_size)
@@ -289,6 +292,7 @@ class QKRotationWrapper(torch.nn.Module):
             self.k_sym = kwargs['k_sym']
             self.k_clip_ratio = kwargs['k_clip_ratio']
             self.k_quant_method = kwargs['k_quant_method']
+            self.rotation_block_size = kwargs.get('rotation_block_size')
             self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, #we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
                                    sym=self.k_sym, clip_ratio=self.k_clip_ratio,
                                    quant_method=self.k_quant_method)
@@ -296,8 +300,8 @@ class QKRotationWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)
         dtype = q.dtype
-        q = hadamard_transform(q.float(), scale=1/math.sqrt(q.shape[-1])).to(dtype)
-        k = hadamard_transform(k.float(), scale=1/math.sqrt(k.shape[-1])).to(dtype)
+        q = quant_utils.hadamard_transform_blockwise(q.float(), self.rotation_block_size).to(dtype)
+        k = quant_utils.hadamard_transform_blockwise(k.float(), self.rotation_block_size).to(dtype)
         (bsz, num_heads, seq_len, head_dim) = k.shape
         
 
