@@ -55,17 +55,19 @@ def evaluator(model, testenc, dev, args):
         (nbatches, batch_size, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     inps = [0] * nbatches
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'attention_mask': [None] * nbatches}
+    if llama_type:
+        cache['position_ids'] = [None] * nbatches
     class Catcher(torch.nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
+            cache['attention_mask'][cache['i']] = kwargs.get('attention_mask')
             if llama_type:
-                cache['position_ids'] = kwargs['position_ids']
+                cache['position_ids'][cache['i']] = kwargs.get('position_ids')
+            cache['i'] += 1
             raise ValueError
     layers[0] = Catcher(layers[0])
    
@@ -91,7 +93,18 @@ def evaluator(model, testenc, dev, args):
 
     torch.cuda.empty_cache()
     outs = [0] * nbatches
-    attention_mask = cache['attention_mask']
+    attention_masks = cache['attention_mask']
+
+    def trim_attention_mask(attention_mask, hidden_states):
+        if attention_mask is None:
+            return None
+        batch_size, seq_len = hidden_states.shape[:2]
+        attention_mask = attention_mask[:batch_size]
+        if attention_mask.dim() == 4:
+            attention_mask = attention_mask[:, :, :seq_len, :seq_len]
+        elif attention_mask.dim() == 2:
+            attention_mask = attention_mask[:, :seq_len]
+        return attention_mask
 
     for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
         layer = layers[i].to(dev)
@@ -105,10 +118,11 @@ def evaluator(model, testenc, dev, args):
             logging.info(f'Dumped layer input and output to: {save_path}')
 
         for j in range(nbatches):
+            attention_mask = trim_attention_mask(attention_masks[j], inps[j])
             if opt_type:
                 outs[j] = layer(inps[j], attention_mask=attention_mask)[0]
             elif llama_type:
-                outs[j] = layer(inps[j], attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j], attention_mask=attention_mask, position_ids=position_ids[j])[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
