@@ -595,7 +595,7 @@ class BFPAttentionOpsWrapper(torch.nn.Module):
             if attention_mask.dim() == 2:
                 causal_mask = attention_mask[:, None, None, : key_states.shape[-2]]
             else:
-                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                causal_mask = attention_mask[:, :, : query_states.shape[-2], : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
