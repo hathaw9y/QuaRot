@@ -8,7 +8,36 @@ from tqdm import tqdm
 
 
 @torch.no_grad()
+def full_gpu_evaluator(model, testenc, dev, args):
+    model.eval()
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    model = model.to(dev)
+
+    input_ids = testenc.input_ids
+    nsamples = input_ids.numel() // model.seqlen
+    input_ids = input_ids[:, :nsamples * model.seqlen].view(nsamples, model.seqlen).to(dev)
+    input_ids = [input_ids[i:i + args.bsz] for i in range(0, nsamples, args.bsz)]
+
+    nlls = []
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+    for batch in tqdm(input_ids, desc="(Eval) Batches"):
+        logits = model(batch).logits
+        shift_logits = logits[:, :-1, :]
+        shift_labels = batch[:, 1:]
+        loss = loss_fct(shift_logits.permute(0, 2, 1), shift_labels)
+        nlls.append(loss.float().mean(dim=1))
+
+    ppl = torch.exp(torch.cat(nlls).mean())
+    model.config.use_cache = use_cache
+    logging.info(f'\n{args.eval_dataset.upper()} PPL: {ppl.item():.3f}')
+    return ppl.item()
+
+
+@torch.no_grad()
 def evaluator(model, testenc, dev, args):
+    if args.eval_full_gpu:
+        return full_gpu_evaluator(model, testenc, dev, args)
 
     model.eval()
 

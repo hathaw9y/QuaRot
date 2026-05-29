@@ -80,6 +80,8 @@ def parser_gen():
     parser.add_argument('--hf_token', type=str, default=None)
     parser.add_argument('--bsz', type=int, default=32,
                         help='Batch-size for PPL evaluation (default:32)')
+    parser.add_argument('--eval_full_gpu', action=argparse.BooleanOptionalAction, default=False,
+                        help='Evaluate PPL with the full model on GPU instead of layer-by-layer CPU/GPU swapping')
 
 
     # Rotation Arguments
