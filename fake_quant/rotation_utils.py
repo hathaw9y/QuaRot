@@ -5,7 +5,7 @@ import utils
 import transformers
 import tqdm, math
 import quant_utils
-from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
+from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, apply_block_had_to_linear, is_pow2
 from fast_hadamard_transform import hadamard_transform
 
 def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
@@ -166,7 +166,7 @@ def rotate_mlp_input(layer, Q, model_type):
         W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
     
-def rotate_mlp_output(layer, Q, model_type):
+def rotate_mlp_output(layer, Q, model_type, online_had_block_size=None):
     # Rotate the MLP output weights and bias.
     if model_type == model_utils.LLAMA_MODEL:
         W = layer.mlp.down_proj
@@ -177,7 +177,10 @@ def rotate_mlp_output(layer, Q, model_type):
     dtype = W.weight.data.dtype
     W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
     W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
-    apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+    if online_had_block_size is None:
+        apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+    else:
+        apply_block_had_to_linear(W, online_had_block_size, output=False)
     if W.bias is not None:
         b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
@@ -220,7 +223,10 @@ def rotate_head(model, Q: torch.Tensor) -> None:
     W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
     W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
-def rotate_ov_proj(layer, model_type, head_num, head_dim):
+def rotate_ov_proj(layer, model_type, head_num, head_dim, online_had_block_size=None, online_o_proj_had=True):
+    if not online_o_proj_had:
+        return
+
     v_proj = layer.self_attn.v_proj
     if model_type == model_utils.LLAMA_MODEL:
         o_proj = layer.self_attn.o_proj
@@ -229,8 +235,11 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
     else:
         raise ValueError(f'Unknown model type {model_type}')
     
-    apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
-    apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+    if online_had_block_size is None:
+        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+    else:
+        apply_block_had_to_linear(o_proj, online_had_block_size, output=False)
 
 
 @torch.inference_mode()
@@ -255,8 +264,15 @@ def rotate_model(model, args):
         rotate_attention_inputs(layers[idx], Q, model_type)
         rotate_attention_output(layers[idx], Q, model_type)
         rotate_mlp_input(layers[idx], Q, model_type)
-        rotate_mlp_output(layers[idx], Q, model_type)
-        rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
+        rotate_mlp_output(layers[idx], Q, model_type, online_had_block_size=block_size)
+        rotate_ov_proj(
+            layers[idx],
+            model_type,
+            num_heads,
+            head_dim,
+            online_had_block_size=block_size,
+            online_o_proj_had=args.online_o_proj_had,
+        )
 
 
 @torch.inference_mode

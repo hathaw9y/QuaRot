@@ -149,6 +149,35 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
     module.weight.data = W_.to(device=dev, dtype=dtype)
 
 
+def apply_block_had_to_linear(module, block_size, output=False):
+    assert isinstance(module, torch.nn.Linear)
+    assert is_pow2(block_size), "Hadamard block_size must be a power of 2!"
+
+    W_ = module.weight.data
+    dtype = W_.dtype
+    dev = W_.device
+    compute_dev = torch.device('cuda') if torch.cuda.is_available() else dev
+    W_ = W_.float().to(compute_dev)
+
+    if output:
+        W_ = W_.t()
+        transposed_shape = W_.shape
+        assert transposed_shape[-1] % block_size == 0, "Output features should be divisible by block_size"
+        W_ = fast_hadamard_transform.hadamard_transform(
+            W_.reshape(-1, transposed_shape[-1] // block_size, block_size).contiguous(),
+            scale=1 / math.sqrt(block_size)
+        ).reshape(transposed_shape).t()
+    else:
+        init_shape = W_.shape
+        assert init_shape[-1] % block_size == 0, "Input features should be divisible by block_size"
+        W_ = fast_hadamard_transform.hadamard_transform(
+            W_.reshape(-1, init_shape[-1] // block_size, block_size).contiguous(),
+            scale=1 / math.sqrt(block_size)
+        ).reshape(init_shape)
+
+    module.weight.data = W_.to(device=dev, dtype=dtype)
+
+
 
 def is_pow2(n):
     return (n & (n - 1) == 0) and (n > 0)
