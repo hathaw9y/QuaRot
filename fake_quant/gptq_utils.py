@@ -11,6 +11,14 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
+def _slice_replay_tensors(attention_mask, position_ids, seqlen):
+    if attention_mask is not None and attention_mask.dim() == 4:
+        attention_mask = attention_mask[:, :, :seqlen, :seqlen]
+    if position_ids is not None:
+        position_ids = position_ids[:, :seqlen]
+    return attention_mask, position_ids
+
+
 class GPTQ:
 
     def __init__(self, layer):
@@ -186,6 +194,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    attention_mask, position_ids = _slice_replay_tensors(attention_mask, position_ids, model.seqlen)
 
     quantizers = {}
     sequential = [

@@ -7,6 +7,14 @@ import logging
 from tqdm import tqdm
 
 
+def _slice_replay_tensors(attention_mask, position_ids, seqlen):
+    if attention_mask is not None and attention_mask.dim() == 4:
+        attention_mask = attention_mask[:, :, :seqlen, :seqlen]
+    if position_ids is not None:
+        position_ids = position_ids[:, :seqlen]
+    return attention_mask, position_ids
+
+
 @torch.no_grad()
 def evaluator(model, testenc, dev, args):
 
@@ -92,6 +100,8 @@ def evaluator(model, testenc, dev, args):
     torch.cuda.empty_cache()
     outs = [0] * nbatches
     attention_mask = cache['attention_mask']
+    if llama_type:
+        attention_mask, position_ids = _slice_replay_tensors(attention_mask, position_ids, model.seqlen)
 
     for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
         layer = layers[i].to(dev)
