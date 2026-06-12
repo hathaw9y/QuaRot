@@ -30,9 +30,19 @@ Currently, we only support **LLaMa-2** models. You can simply run the `main.py` 
 - `--w_groupsize`: The group size for weight quantization
 - `--v_groupsize`: The group size for value quantization
 - `--k_groupsize`: The group size for key quantization
+- `--quant_format`: The fake quantization format (`int` or `mxfp4`)
+- `--mx_block_size`: The MXFP4 block size. The default is 32.
   
 For example, to run the perplexity of `LLaMA2-7B` model with quantizing all weights and activations, you can run the following command:
 
 ```bash
 /bin/python main.py --model meta-llama/Llama-2-7b-hf  --rotate --a_bits 4 --v_bits 4 --k_bits 4 --w_bits 4 --w_clip
 ```
+
+To simulate MXFP4 for weights, linear activations, and K/V cache, run:
+
+```bash
+python main.py --model meta-llama/Llama-2-7b-hf --rotate --quant_format mxfp4 --w_bits 4 --a_bits 4 --k_bits 4 --v_bits 4
+```
+
+MXFP4 simulation uses E2M1 FP4 values with one power-of-two scale per contiguous block of 32 values by default. This path is fake quantization only; the packed int4 CUDA runtime and checkpoint export are unchanged.

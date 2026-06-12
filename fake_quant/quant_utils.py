@@ -37,6 +37,40 @@ def sym_dequant(q, scale):
 def sym_quant_dequant(x, scale, maxq):
     return sym_dequant(*sym_quant(x, scale, maxq))
 
+def _mxfp4_block_scales(x, block_size=32, clip_ratio=1.0):
+    max_abs = torch.amax(torch.abs(x), dim=-1, keepdim=True) * clip_ratio
+    safe_max = torch.clamp(max_abs, min=1e-30)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(safe_max / 6.0)))
+    return torch.where(max_abs == 0, torch.ones_like(scale), scale)
+
+def _mxfp4_quant_dequant_with_scale(x, scale):
+    x_dtype = x.dtype
+    codebook = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                            device=x.device, dtype=torch.float32)
+    scaled = x.float() / scale.float()
+    sign = torch.sign(scaled)
+    abs_scaled = torch.abs(scaled)
+    indexes = torch.argmin(torch.abs(abs_scaled.unsqueeze(-1) - codebook), dim=-1)
+    quantized = codebook[indexes] * sign
+    return (quantized * scale.float()).to(x_dtype)
+
+def mxfp4_quant_dequant(x, block_size=32, clip_ratio=1.0):
+    assert block_size > 0, 'MX block size should be positive'
+    assert clip_ratio <= 1 and clip_ratio > 0, 'Clip ratio should be in (0, 1]'
+
+    init_shape = x.shape
+    last_dim = init_shape[-1]
+    pad = (block_size - last_dim % block_size) % block_size
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
+
+    blocked = x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
+    scale = _mxfp4_block_scales(blocked, block_size=block_size, clip_ratio=clip_ratio)
+    quantized = _mxfp4_quant_dequant_with_scale(blocked, scale).reshape(*x.shape)
+    if pad:
+        quantized = quantized[..., :last_dim]
+    return quantized.reshape(init_shape)
+
 
 def two_compl(x, bits: int):
     return torch.where(x < 0, 2 ** bits + x, x)
@@ -90,6 +124,8 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer('scale', torch.zeros(1))
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
+        self.quant_format = "int"
+        self.mx_block_size = 32
 
     def free(self):
         self.zero = None
@@ -99,23 +135,30 @@ class ActQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         if self.bits == 16:
             return x
+        if self.quant_format == "mxfp4":
+            return mxfp4_quant_dequant(x, self.mx_block_size, self.clip_ratio).to(x_dtype)
         elif self.sym:
             return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
         return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
 
     # Different from `forward`, this method returns quantized integers, scales (and zeros if asymmetric).
     def quantize(self, x):
+        if self.quant_format == "mxfp4":
+            return mxfp4_quant_dequant(x, self.mx_block_size, self.clip_ratio)
         if self.sym:
             return sym_quant(x, self.scale, self.maxq)
         else:
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
-    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0):
+    def configure(self, bits, groupsize=-1, sym=False, clip_ratio=1.0,
+                  quant_format="int", mx_block_size=32):
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
+        self.quant_format = quant_format
+        self.mx_block_size = mx_block_size
         assert self.clip_ratio <= 1 and self.clip_ratio > 0, 'Clip ratio should be in (0, 1]'
 
     def find_params_per_token_groupwise(self, x):
@@ -142,6 +185,8 @@ class ActQuantizer(torch.nn.Module):
 
     def find_params(self, x):
         if self.bits == 16:
+            return
+        if self.quant_format == "mxfp4":
             return
 
         dev = x.device
@@ -205,11 +250,13 @@ class ActQuantWrapper(torch.nn.Module):
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
         if self.quantizer.bits < 16:
-            str_ += f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)'
+            str_ += f' (MXFP4, block={self.quantizer.mx_block_size})' if self.quantizer.quant_format == "mxfp4" else (
+                f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)')
 
         str_ += f'\nOutput Quantizer Bits: {self.out_quantizer.bits}'
         if self.out_quantizer.bits < 16:
-            str_ += f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)'
+            str_ += f' (MXFP4, block={self.out_quantizer.mx_block_size})' if self.out_quantizer.quant_format == "mxfp4" else (
+                f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)')
 
         return str_
 
@@ -265,11 +312,16 @@ class WeightQuantizer(torch.nn.Module):
         self.register_buffer('maxq', torch.tensor(0))
         self.register_buffer('scale', torch.zeros(shape))
         self.register_buffer('zero', torch.zeros(shape))
+        self.quant_format = "int"
+        self.mx_block_size = 32
+        self.clip_ratio = 1.0
+        self._mx_col_offset = 0
 
     def configure(
         self,
         bits, perchannel=False, sym=True,
         mse=False, norm=2.4, grid=100, maxshrink=.8,
+        quant_format="int", mx_block_size=32, clip_ratio=1.0,
     ):
         self.bits = bits
         self.perchannel = perchannel
@@ -278,6 +330,10 @@ class WeightQuantizer(torch.nn.Module):
         self.norm = norm
         self.grid = grid
         self.maxshrink = maxshrink
+        self.quant_format = quant_format
+        self.mx_block_size = mx_block_size
+        self.clip_ratio = clip_ratio
+        self._mx_col_offset = 0
         if sym:
             self.maxq = torch.tensor(2**(bits-1)-1)
         else:
@@ -294,6 +350,30 @@ class WeightQuantizer(torch.nn.Module):
             x = x.flatten(1)
         else:
             x = x.flatten().unsqueeze(0)
+
+        if self.quant_format == "mxfp4":
+            pad = (self.mx_block_size - x.shape[-1] % self.mx_block_size) % self.mx_block_size
+            if pad:
+                x = torch.nn.functional.pad(x, (0, pad))
+            blocked = x.reshape(x.shape[0], x.shape[1] // self.mx_block_size, self.mx_block_size)
+            if self.mse:
+                best = torch.full(blocked.shape[:-1], float('inf'), device=dev)
+                best_scale = _mxfp4_block_scales(blocked, self.mx_block_size, self.clip_ratio)
+                for i in range(int(self.maxshrink * self.grid)):
+                    p = 1 - i / self.grid
+                    scale1 = _mxfp4_block_scales(blocked, self.mx_block_size, self.clip_ratio * p)
+                    q = _mxfp4_quant_dequant_with_scale(blocked, scale1)
+                    err = torch.sum(torch.abs(q - blocked).pow(self.norm), dim=-1)
+                    tmp = err < best
+                    if torch.any(tmp):
+                        best[tmp] = err[tmp]
+                        best_scale[tmp] = scale1[tmp]
+                self.scale = best_scale.squeeze(-1)
+            else:
+                self.scale = _mxfp4_block_scales(blocked, self.mx_block_size, self.clip_ratio).squeeze(-1)
+            self.zero = torch.zeros_like(self.scale)
+            self._mx_col_offset = 0
+            return
 
         tmp = torch.zeros(x.shape[0], device=dev)
         xmin = torch.minimum(x.min(1)[0], tmp)
@@ -351,6 +431,23 @@ class WeightQuantizer(torch.nn.Module):
     def quantize(self, x):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
+            if self.quant_format == "mxfp4":
+                if x.shape[-1] == 1 and self.scale.dim() == 2:
+                    block_idx = min(self._mx_col_offset // self.mx_block_size, self.scale.shape[-1] - 1)
+                    scale = self.scale[:, block_idx].reshape(-1, 1)
+                    self._mx_col_offset += 1
+                    return _mxfp4_quant_dequant_with_scale(x, scale).to(x_dtype)
+                if x.dim() == 2 and self.scale.dim() == 2 and x.shape[0] == self.scale.shape[0]:
+                    last_dim = x.shape[-1]
+                    pad = (self.mx_block_size - last_dim % self.mx_block_size) % self.mx_block_size
+                    x_pad = torch.nn.functional.pad(x, (0, pad)) if pad else x
+                    blocked = x_pad.reshape(x_pad.shape[0], x_pad.shape[1] // self.mx_block_size, self.mx_block_size)
+                    scale = self.scale[:, :blocked.shape[1]].unsqueeze(-1)
+                    q = _mxfp4_quant_dequant_with_scale(blocked, scale).reshape_as(x_pad)
+                    if pad:
+                        q = q[:, :last_dim]
+                    return q.to(x_dtype)
+                return mxfp4_quant_dequant(x, self.mx_block_size, self.clip_ratio).to(x_dtype)
             if self.sym:
                 return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
             return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
@@ -369,10 +466,12 @@ def add_actquant(module, name='', layers=[torch.nn.Linear,
                                           transformers.models.falcon.modeling_falcon.FalconLinear]):
     if isinstance(module, ActQuantWrapper):
         return
-    for attr in dir(module):
-        tmp = getattr(module, attr)
+    for attr, tmp in list(module._modules.items()):
+        if tmp is None:
+            continue
         if type(tmp) in layers:
             setattr(module, attr, ActQuantWrapper(tmp))
+            continue
         if type(tmp) == torch.nn.Sequential:
             replaced = []
             for i, child in enumerate(tmp.children()):
@@ -381,6 +480,7 @@ def add_actquant(module, name='', layers=[torch.nn.Linear,
                 else:
                     replaced.append(child)
             setattr(module, attr, torch.nn.Sequential(*replaced))
+            continue
         if type(tmp) == torch.nn.ModuleList:
             replaced = []
             for i, child in enumerate(tmp.children()):
@@ -389,6 +489,7 @@ def add_actquant(module, name='', layers=[torch.nn.Linear,
                 else:
                     replaced.append(child)
             setattr(module, attr, torch.nn.ModuleList(replaced))
+            continue
     for name1, child in module.named_children():
         add_actquant(child, name + '.' + name1 if name != '' else name1, layers)
 

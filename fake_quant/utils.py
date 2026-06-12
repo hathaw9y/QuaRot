@@ -128,6 +128,10 @@ def parser_gen():
 
 
     # General Quantization Arguments
+    parser.add_argument('--quant_format', type=str, default='int', choices=['int', 'mxfp4'],
+                        help='Quantization format for fake quantization')
+    parser.add_argument('--mx_block_size', type=int, default=32,
+                        help='MXFP4 block size used when --quant_format=mxfp4')
     parser.add_argument('--int8_down_proj', action=argparse.BooleanOptionalAction, default=False,
                         help='Use INT8 for Down Projection! If this set, both weights and activations of this layer will be in INT8')
 
@@ -206,7 +210,17 @@ def parser_gen():
 
     config_logging(os.path.join(args.save_path, f'{args.save_name}.log'))
     
-    assert args.a_groupsize == args.w_groupsize, 'a_groupsize should be the same as w_groupsize!'
+    if args.quant_format == 'mxfp4':
+        assert args.mx_block_size > 0, 'mx_block_size should be positive!'
+        assert not args.int8_down_proj, 'int8_down_proj is not supported with MXFP4!'
+        for name in ['w_bits', 'a_bits', 'k_bits', 'v_bits']:
+            assert getattr(args, name) in [4, 16], f'{name} should be 4 or 16 for MXFP4!'
+        if args.w_asym or args.a_asym or args.k_asym or args.v_asym:
+            logging.warning('MXFP4 ignores asymmetric quantization flags and uses E2M1 values with block scales.')
+        if args.w_groupsize > 0 or args.a_groupsize > 0 or args.k_groupsize > 0 or args.v_groupsize > 0:
+            logging.warning('MXFP4 ignores *_groupsize; use --mx_block_size for MX block size.')
+    else:
+        assert args.a_groupsize == args.w_groupsize, 'a_groupsize should be the same as w_groupsize!'
     assert args.k_pre_rope == False, 'Pre-RoPE quantization is not supported yet!'
 
     if args.model == 'facebook/opt-125m' or args.model == 'facebook/opt-1.3b':

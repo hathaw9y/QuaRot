@@ -277,13 +277,17 @@ class QKRotationWrapper(torch.nn.Module):
         self.k_quantizer = quant_utils.ActQuantizer()
         self.k_bits = 16
         if kwargs is not None:
-            assert kwargs['k_groupsize'] in [-1, head_dim], f'Only token-wise/{head_dim}g quantization is supported for K-cache'
+            self.quant_format = kwargs.get('quant_format', 'int')
+            self.mx_block_size = kwargs.get('mx_block_size', 32)
+            if self.quant_format != 'mxfp4':
+                assert kwargs['k_groupsize'] in [-1, head_dim], f'Only token-wise/{head_dim}g quantization is supported for K-cache'
             self.k_bits = kwargs['k_bits']
-            self.k_groupsize = kwargs['k_groupsize']
+            self.k_groupsize = -1 if self.quant_format == 'mxfp4' else kwargs['k_groupsize']
             self.k_sym = kwargs['k_sym']
             self.k_clip_ratio = kwargs['k_clip_ratio']
             self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, #we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio)
+                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio,
+                                   quant_format=self.quant_format, mx_block_size=self.mx_block_size)
 
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)

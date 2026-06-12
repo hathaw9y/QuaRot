@@ -67,6 +67,8 @@ class GPTQ:
             W = W[:, perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
+            if self.quantizer.quant_format == "mxfp4" and groupsize == -1:
+                self.quantizer.find_params(W)
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
@@ -212,7 +214,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name] = GPTQ(subset[name])
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
-                    layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
+                    layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip,
+                    quant_format=args.quant_format, mx_block_size=args.mx_block_size,
+                    clip_ratio=1.0
                 )
 
             def add_batch(name):
@@ -228,7 +232,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                 h.remove()
 
             for name in subset:
-                layer_w_groupsize = args.w_groupsize
+                layer_w_groupsize = -1 if args.quant_format == "mxfp4" else args.w_groupsize
                 gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=layer_w_groupsize, actorder=args.act_order, static_groups=False
                 )
@@ -259,7 +263,8 @@ def rtn_fwrd(model, dev, args):
     From GPTQ repo 
     TODO: Make this function general to support both OPT and LLaMA models
     '''
-    assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
+    if args.quant_format != "mxfp4":
+        assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
     layers = model.model.layers
     torch.cuda.empty_cache()
 
@@ -281,7 +286,9 @@ def rtn_fwrd(model, dev, args):
 
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
-                layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
+                layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip,
+                quant_format=args.quant_format, mx_block_size=args.mx_block_size,
+                clip_ratio=1.0
             )
             W = subset[name].weight.data
             quantizer.find_params(W)
